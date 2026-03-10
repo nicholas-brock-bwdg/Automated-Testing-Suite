@@ -1,0 +1,104 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/nicholas-brock-bwdg/Automated-Testing-Suite/config/schema.json",
+  "title": "IgnitionTestManifest",
+  "description": "Manifest schema for the Ignition Perspective test automation system",
+  "type": "object",
+  "required": ["version", "project", "gateway", "generated_at", "views"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "string",
+      "description": "Manifest schema version",
+      "pattern": "^\\d+\\.\\d+$"
+    },
+    "project": {
+      "type": "string",
+      "description": "Ignition project name as it appears in the gateway"
+    },
+    "gateway": {
+      "type": "string",
+      "format": "uri",
+      "description": "Base URL of the Ignition Gateway used during discovery"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp of when the manifest was last generated"
+    },
+    "views": {
+      "type": "array",
+      "description": "All discovered Perspective views",
+      "items": {
+        "$ref": "#/definitions/view"
+      }
+    }
+  },
+  "definitions": {
+    "view": {
+      "type": "object",
+      "required": ["id", "path", "url", "discovered_by", "reachable", "requires_auth", "tests"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Stable identifier derived from the view path (e.g. view__home)",
+          "pattern": "^view__[a-z0-9_/]+$"
+        },
+        "path": {
+          "type": "string",
+          "description": "Perspective view path as returned by the API (e.g. /home)",
+          "pattern": "^/"
+        },
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Full URL to the view in the Perspective client"
+        },
+        "discovered_by": {
+          "type": "string",
+          "enum": ["api", "browser", "both"],
+          "description": "Which discovery pass found this view"
+        },
+        "reachable": {
+          "type": "boolean",
+          "description": "Whether the browser pass could navigate to this view"
+        },
+        "requires_auth": {
+          "type": "boolean",
+          "description": "Whether the view requires authentication to access"
+        },
+        "nav_path": {
+          "type": "array",
+          "description": "Ordered list of nav labels that lead to this view (from browser pass)",
+          "items": {
+            "type": "string"
+          }
+        },
+        "warnings": {
+          "type": "array",
+          "description": "Discovery discrepancies or issues flagged during reconciliation",
+          "items": {
+            "type": "string"
+          }
+        },
+        "tests": {
+          "$ref": "#/definitions/testFlags"
+        }
+      }
+    },
+    "testFlags": {
+      "type": "object",
+      "description": "Which test types are enabled for this view",
+      "required": ["smoke", "navigation", "components", "auth", "screenshot"],
+      "additionalProperties": false,
+      "properties": {
+        "smoke":       { "type": "boolean" },
+        "navigation":  { "type": "boolean" },
+        "components":  { "type": "boolean" },
+        "auth":        { "type": "boolean" },
+        "screenshot":  { "type": "boolean" }
+      }
+    }
+  }
+}
