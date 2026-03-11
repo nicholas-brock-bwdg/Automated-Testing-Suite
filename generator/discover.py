@@ -41,7 +41,10 @@ def _credentials() -> Optional[tuple]:
 def _auth_opener(username, password, realm_url):
     mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
     mgr.add_password(None, realm_url, username, password)
-    return urllib.request.build_opener(urllib.request.HTTPBasicAuthHandler(mgr))
+    return urllib.request.build_opener(
+        urllib.request.HTTPBasicAuthHandler(mgr),
+        urllib.request.HTTPSHandler(context=_ssl_ctx),
+    )
 
 
 # ===========================================================================
