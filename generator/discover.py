@@ -1,10 +1,11 @@
 """
 discover.py — Two-pass view discovery for Ignition Perspective.
 
-Pass 1 (API):     Queries the Ignition REST API for the complete view tree.
-Pass 2 (Browser): Validates reachability and detects auth requirements via
-                  HTTP probing + HTML scanning. Full JS-rendered auth detection
-                  (via agent-browser) is a planned future enhancement.
+Pass 1 (Filesystem): Walk views_directory for view.json files.
+                     No gateway, no network, no auth required.
+Pass 2 (Gateway):   Validate reachability against the live gateway via the
+                    REST API + HTTP probing. Non-blocking: if the gateway is
+                    unreachable the run continues with filesystem-only results.
 
 Entry point: run(config) -> list[dict]
 """
@@ -19,6 +20,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Optional
 
 # Accept self-signed / internal CA certificates common in local Ignition installs.
@@ -48,7 +50,58 @@ def _auth_opener(username, password, realm_url):
 
 
 # ===========================================================================
-# PASS 1 — API
+# PASS 1 — Filesystem
+# ===========================================================================
+
+def filesystem_pass(views_directory, exclude_views, *, debug=True):
+    """
+    Walk views_directory and collect view paths from view.json files.
+
+    Each Perspective view is a folder containing a view.json file.
+    The folder path relative to views_directory becomes the view path:
+        {views_directory}/folder/subpage/view.json  ->  /folder/subpage
+
+    Args:
+        views_directory: Path (str or Path) to the views root.
+        exclude_views:   List of view paths to exclude.
+        debug:           If True, print each discovered path.
+
+    Returns:
+        Sorted, deduplicated list of view path strings (each starting with /).
+    """
+    views_dir = Path(views_directory)
+    print(f"\n[Pass 1 — Filesystem]  Walking {views_dir.resolve()}")
+
+    if not views_dir.exists():
+        print(
+            f"  WARNING: views_directory '{views_dir}' does not exist. "
+            "No filesystem views discovered.",
+            file=sys.stderr,
+        )
+        return []
+
+    excluded  = set(exclude_views or [])
+    raw_paths = []
+
+    for view_json in sorted(views_dir.rglob("view.json")):
+        rel  = view_json.parent.relative_to(views_dir)
+        path = "/" + rel.as_posix()   # e.g. /folder/subpage
+        raw_paths.append(path)
+
+    paths = sorted(
+        {p.rstrip("/") for p in raw_paths if p and p.rstrip("/") not in excluded}
+    )
+
+    print(f"\n  {len(raw_paths)} raw paths -> {len(paths)} after dedup/exclusion")
+    if debug:
+        for p in paths:
+            print(f"    {p}")
+
+    return paths
+
+
+# ===========================================================================
+# PASS 2 — Gateway validation (API fetch + HTTP probe)
 # ===========================================================================
 
 def _flatten_tree(node, prefix=""):
@@ -62,11 +115,10 @@ def _flatten_tree(node, prefix=""):
     if not name:
         return []
 
-    path = f"{prefix}/{name}" if prefix else f"/{name}"
+    path     = f"{prefix}/{name}" if prefix else f"/{name}"
     children = node.get("children") or []
 
     paths = []
-    # Leaf: has resourceType or no children
     if node.get("resourceType") or not children:
         paths.append(path)
     for child in children:
@@ -129,23 +181,18 @@ def _extract_paths_from_data(data):
     return paths
 
 
-def api_pass(gateway_url, project_name, exclude_views, *, debug=True):
+def _api_fetch(gateway_url, project_name):
     """
-    Query the Ignition REST API for the complete view list.
+    Fetch the view list from the Ignition REST API.
 
-    Endpoint: GET {gateway_url}/data/perspective/views?projectName={project}
-
-    Auth: tries unauthenticated first; retries with basic auth on HTTP 401.
-    Returns a sorted, deduplicated list of view paths.
-    Paths in exclude_views are filtered out.
-    Logs the raw response structure so shape issues can be debugged without
-    a full re-run if the API returns an unexpected format.
+    Returns (list[str] paths, error_str_or_None).
+    On any failure returns ([], error_message) — does not raise.
     """
     endpoint = (
         f"{gateway_url}/data/perspective/views"
         f"?projectName={urllib.parse.quote(project_name)}"
     )
-    print(f"\n[Pass 1 — API]  GET {endpoint}")
+    print(f"\n[Pass 2 — Gateway]  GET {endpoint}")
 
     creds = _credentials()
 
@@ -153,18 +200,26 @@ def api_pass(gateway_url, project_name, exclude_views, *, debug=True):
         if with_auth and creds:
             opener = _auth_opener(*creds, gateway_url)
         else:
-            opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=_ssl_ctx))
+            opener = urllib.request.build_opener(
+                urllib.request.HTTPSHandler(context=_ssl_ctx)
+            )
         req = urllib.request.Request(endpoint)
         try:
             with opener.open(req, timeout=30) as resp:
                 return resp.status, resp.read()
         except urllib.error.HTTPError as exc:
             return exc.code, b""
+        except urllib.error.URLError as exc:
+            return None, str(exc.reason)
 
     status, body = _get(with_auth=False)
+
+    if status is None:
+        return [], f"Gateway unreachable: {body}"
+
     if status == 401:
         if not creds:
-            raise RuntimeError(
+            return [], (
                 "API returned 401 but no credentials are set. "
                 "Set IGNITION_TEST_USER and IGNITION_TEST_PASSWORD."
             )
@@ -172,15 +227,12 @@ def api_pass(gateway_url, project_name, exclude_views, *, debug=True):
         status, body = _get(with_auth=True)
 
     if status != 200:
-        raise RuntimeError(
-            f"API pass failed: HTTP {status} from {endpoint}\n"
-            "  Check IGNITION_GATEWAY_URL, IGNITION_PROJECT_NAME, and credentials."
-        )
+        return [], f"HTTP {status} from {endpoint}"
 
     try:
         data = json.loads(body)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"API returned non-JSON: {exc}") from exc
+        return [], f"API returned non-JSON: {exc}"
 
     # ----- Log raw structure for debugging -----
     print("  Raw API response:")
@@ -194,26 +246,11 @@ def api_pass(gateway_url, project_name, exclude_views, *, debug=True):
         print(f"    Type: dict   Keys: {list(data.keys())}")
     print(f"    Content (first 1000 chars): {json.dumps(data)[:1000]}")
 
-    # ----- Extract and normalise -----
     raw_paths = _extract_paths_from_data(data)
-    excluded  = set(exclude_views or [])
-    paths = sorted(
-        {p.rstrip("/") for p in raw_paths if p and p.rstrip("/") not in excluded}
-    )
+    paths     = sorted({p.rstrip("/") for p in raw_paths if p})
+    print(f"  {len(raw_paths)} raw paths -> {len(paths)} unique gateway paths")
+    return paths, None
 
-    print(
-        f"\n  {len(raw_paths)} raw paths → {len(paths)} after dedup/exclusion"
-    )
-    if debug:
-        for p in paths:
-            print(f"    {p}")
-
-    return paths
-
-
-# ===========================================================================
-# PASS 2 — Browser (HTTP probe + HTML scan)
-# ===========================================================================
 
 _LOGIN_URL_SIGNALS = ["login", "/auth", "status=401", "status=403"]
 _LOGIN_HTML_SIGNALS = [
@@ -236,7 +273,7 @@ def _probe(url, username=None, password=None):
         status        int
         final_url     str
         reachable     bool
-        requires_auth bool   — HTTP-level redirect or HTML scan
+        requires_auth bool
         error         str|None
     """
     result = {
@@ -288,30 +325,41 @@ def _probe(url, username=None, password=None):
     return result
 
 
-def browser_pass(gateway_url, project_name, api_paths):
+def gateway_pass(gateway_url, project_name, fs_paths):
     """
-    Best-effort browser pass: probe each API-discovered view via HTTP.
+    Validate filesystem-discovered views against the live gateway.
 
-    For each view:
-      1. Probe unauthenticated — detect HTTP-level auth redirects or errors.
-      2. If auth was signalled, probe again with credentials to confirm reachability.
+    Strategy:
+      1. Fetch the gateway's own view list via the REST API.
+      2. HTTP-probe each filesystem URL to confirm reachability and detect auth.
 
-    Limitation: Perspective is a React SPA. Auth implemented purely client-side
-    (no HTTP redirect) will not be detected here. Full JS-rendered detection
-    requires Playwright or agent-browser (planned for a future phase).
+    Non-blocking: on any gateway failure, logs a warning and returns empty
+    results so the caller can continue with filesystem-only results.
 
-    Returns a list of result dicts, one per view.
+    Returns:
+        (gateway_paths: list[str], probe_results: list[dict], error: str|None)
     """
+    # Step 1: API fetch
+    gateway_paths, api_error = _api_fetch(gateway_url, project_name)
+    if api_error:
+        print(
+            f"\n  WARNING: Gateway API fetch failed — {api_error}\n"
+            "  Continuing with filesystem-only results.",
+            file=sys.stderr,
+        )
+        return [], [], api_error
+
+    # Step 2: HTTP probe each filesystem path
     print(
-        f"\n[Pass 2 — Browser]  Probing {len(api_paths)} views...\n"
+        f"\n  Probing {len(fs_paths)} filesystem views via HTTP...\n"
         "  Note: JS-rendered auth detection requires agent-browser (future phase)."
     )
 
-    creds            = _credentials()
+    creds              = _credentials()
     username, password = creds if creds else (None, None)
-    results = []
+    probe_results      = []
 
-    for path in api_paths:
+    for path in fs_paths:
         view_url = (
             f"{gateway_url}/data/perspective/client"
             f"/{urllib.parse.quote(project_name)}{path}"
@@ -338,76 +386,81 @@ def browser_pass(gateway_url, project_name, api_paths):
         auth_note = " [auth required]" if requires_auth else ""
         print(f"    {icon}  {path:<45}  {status_label}{auth_note}")
 
-        results.append({
+        probe_results.append({
             "path":          path,
             "url":           view_url,
             "reachable":     reachable,
             "requires_auth": requires_auth,
-            "nav_path":      [],   # populated by agent-browser in future phase
+            "nav_path":      [],
         })
 
-    return results
+    return gateway_paths, probe_results, None
 
 
 # ===========================================================================
 # RECONCILIATION
 # ===========================================================================
 
-def reconcile(api_paths, browser_results):
+def reconcile(fs_paths, gateway_paths, probe_results):
     """
-    Merge API and browser results into the unified view list for the manifest.
+    Merge filesystem and gateway results into the unified view list.
+
+    Filesystem is the source of truth for what views exist.
 
     Tagging rules:
-      API-only              -> discovered_by="api",    reachable assumed True
-      Both (reachable)      -> discovered_by="both",   use browser values
-      Both (not reachable)  -> discovered_by="both",   warning added
-      Browser-only          -> discovered_by="browser", warning added
+      fs only (unvalidated)  -> discovered_by="filesystem",   reachable=None
+      fs + gateway confirmed -> discovered_by="both",         use probe values
+      gateway only           -> discovered_by="gateway_only", warning added
     """
-    by_path     = {r["path"]: r for r in browser_results}
-    api_set     = set(api_paths)
-    browser_set = set(by_path.keys())
+    probe_by_path = {r["path"]: r for r in probe_results}
+    gateway_set   = set(gateway_paths)
+    fs_set        = set(fs_paths)
 
     views = []
 
-    for path in sorted(api_paths):
-        br = by_path.get(path)
+    for path in sorted(fs_paths):
+        pr = probe_by_path.get(path)
 
-        if br is None:
+        if pr is None:
+            # Gateway not available — filesystem only, reachability unknown
             entry = {
                 "path":          path,
-                "discovered_by": "api",
-                "reachable":     True,
+                "discovered_by": "filesystem",
+                "reachable":     None,
                 "requires_auth": False,
                 "nav_path":      [],
+                "warnings":      ["Gateway validation not performed — view unvalidated"],
             }
         else:
             warnings = []
-            if not br["reachable"]:
+            if not pr["reachable"]:
                 warnings.append(
-                    "View found in API but not reachable via browser probe"
+                    "View found on filesystem but not reachable via gateway probe"
                 )
             entry = {
                 "path":          path,
                 "discovered_by": "both",
-                "reachable":     br["reachable"],
-                "requires_auth": br["requires_auth"],
-                "nav_path":      br.get("nav_path", []),
+                "reachable":     pr["reachable"],
+                "requires_auth": pr["requires_auth"],
+                "nav_path":      pr.get("nav_path", []),
             }
             if warnings:
                 entry["warnings"] = warnings
 
         views.append(entry)
 
-    # Browser-only: reachable via navigation but absent from API
-    for path in sorted(browser_set - api_set):
-        br = by_path[path]
+    # Gateway-only: returned by gateway API but absent from filesystem
+    for path in sorted(gateway_set - fs_set):
         views.append({
             "path":          path,
-            "discovered_by": "browser",
+            "discovered_by": "gateway_only",
             "reachable":     True,
-            "requires_auth": br["requires_auth"],
-            "nav_path":      br.get("nav_path", []),
-            "warnings":      ["View reachable via browser but absent from API"],
+            "requires_auth": False,
+            "nav_path":      [],
+            "warnings":      [
+                "View returned by gateway API but not found on filesystem — "
+                "possible stale gateway state or uncommitted view"
+            ],
         })
 
     return views
@@ -419,56 +472,67 @@ def reconcile(api_paths, browser_results):
 
 def run(config, *, debug=True):
     """
-    Run full two-pass discovery against the live gateway.
+    Run two-pass filesystem-first discovery.
+
+    Pass 1: Walk views_directory for view.json files (no gateway required).
+    Pass 2: Validate against live gateway API + HTTP probe (non-blocking).
 
     Args:
         config: loaded gateway-config.json dict
-        debug:  if True, print each discovered path during the API pass
+        debug:  if True, print each discovered path during the filesystem pass
 
     Returns:
         Reconciled list of view dicts, ready for manifest.build_manifest().
-
-    Raises:
-        RuntimeError on unrecoverable API pass failure.
     """
     gateway_url  = config["gateway_url"].rstrip("/")
     project_name = config["project_name"]
     exclude      = config.get("exclude_views", [])
+    views_dir    = config.get("views_directory", "ignition/views")
 
-    # Pass 1: API
-    api_paths = api_pass(gateway_url, project_name, exclude, debug=debug)
+    # Pass 1: Filesystem
+    fs_paths = filesystem_pass(views_dir, exclude, debug=debug)
 
-    if not api_paths:
+    if not fs_paths:
         print(
-            "\n  WARNING: API pass returned no views. "
-            "Check IGNITION_PROJECT_NAME and gateway connectivity.",
+            f"\n  WARNING: Filesystem pass returned no views. "
+            f"Check that views_directory '{views_dir}' contains view.json files.",
             file=sys.stderr,
         )
 
-    # Pass 2: Browser (best-effort)
+    # Pass 2: Gateway validation (best-effort, non-blocking)
     try:
-        browser_results = browser_pass(gateway_url, project_name, api_paths)
+        gateway_paths, probe_results, gateway_error = gateway_pass(
+            gateway_url, project_name, fs_paths
+        )
     except Exception as exc:
         print(
-            f"\n  WARNING: Browser pass failed — {exc}\n"
-            "  Continuing with API-only results.",
+            f"\n  WARNING: Gateway pass failed unexpectedly — {exc}\n"
+            "  Continuing with filesystem-only results.",
             file=sys.stderr,
         )
-        browser_results = []
+        gateway_paths = []
+        probe_results = []
+        gateway_error = str(exc)
 
     # Reconcile
-    views = reconcile(api_paths, browser_results)
+    views = reconcile(fs_paths, gateway_paths, probe_results)
 
     # Summary
-    reachable_n = sum(1 for v in views if v.get("reachable"))
-    auth_n      = sum(1 for v in views if v.get("requires_auth"))
-    warn_n      = sum(1 for v in views if v.get("warnings"))
+    reachable_n   = sum(1 for v in views if v.get("reachable") is True)
+    unvalidated_n = sum(1 for v in views if v.get("reachable") is None)
+    auth_n        = sum(1 for v in views if v.get("requires_auth"))
+    gw_only_n     = sum(1 for v in views if v.get("discovered_by") == "gateway_only")
+    warn_n        = sum(1 for v in views if v.get("warnings"))
 
     print(f"\n  Discovery summary:")
-    print(f"    Total views   : {len(views)}")
-    print(f"    Reachable     : {reachable_n}")
-    print(f"    Require auth  : {auth_n}")
+    print(f"    Total views      : {len(views)}")
+    print(f"    Reachable        : {reachable_n}")
+    if unvalidated_n:
+        print(f"    Unvalidated      : {unvalidated_n}  (gateway not available)")
+    print(f"    Require auth     : {auth_n}")
+    if gw_only_n:
+        print(f"    Gateway-only     : {gw_only_n}  (not on filesystem)")
     if warn_n:
-        print(f"    With warnings : {warn_n}")
+        print(f"    With warnings    : {warn_n}")
 
     return views

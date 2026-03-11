@@ -22,21 +22,20 @@ Full spec: @docs/IGNITION_TEST_SYSTEM.md
 - [helpers/](helpers/) — stubs for Phase 4/5
 - [actions/](actions/) — stub for Phase 6
 
-## generator/discover.py — design
-- `api_pass(gateway_url, project_name, exclude_views, *, debug)` → list[str]
-  - GET /data/perspective/views?projectName={project}
-  - Tries unauthenticated first; retries with basic auth on HTTP 401
-  - Logs raw response shape (type, keys, first 1000 chars) for debugging
-  - Handles: list[str], list[dict], {views:[...]}, tree {name,children}, unknown
-  - Excludes paths in config["exclude_views"]
-- `browser_pass(gateway_url, project_name, api_paths)` → list[dict]
-  - HTTP probe each view URL (unauthenticated, then authenticated if blocked)
-  - Detects auth via HTTP 401/403, redirect URL signals, HTML content scan
-  - Limitation: JS-rendered auth (Perspective SPA) not detectable — noted, future agent-browser phase
-  - nav_path always [] for now — agent-browser will populate in future
-- `reconcile(api_paths, browser_results)` → list[dict]
-  - Tags: api / both / browser
-  - Flags API-only unreachable and browser-only views with warnings
+## generator/discover.py — design (filesystem-first)
+- `filesystem_pass(views_directory, exclude_views, *, debug)` → list[str]
+  - Walk views_directory for view.json files; folder path relative to views_directory = view path
+  - No gateway, no network, no auth required; sorted + deduped
+- `gateway_pass(gateway_url, project_name, fs_paths)` → (gateway_paths, probe_results, error|None)
+  - Non-blocking: returns ([], [], error_str) if gateway unreachable
+  - Step 1: _api_fetch() — GET /data/perspective/views?projectName={project}
+    - Tries unauthenticated, retries with Basic auth on 401
+    - Handles list[str], list[dict], {views:[...]}, tree {name,children}, unknown shape
+  - Step 2: HTTP probe each filesystem URL — auth via 401/403, URL signals, HTML scan
+  - nav_path always [] — agent-browser future phase
+- `reconcile(fs_paths, gateway_paths, probe_results)` → list[dict]
+  - Tags: "filesystem" (reachable=None) / "both" (probe values) / "gateway_only" (warning)
+  - Filesystem is source of truth
 - `run(config, *, debug)` → list[dict] — main entry point
 
 ## generator/manifest.py — design

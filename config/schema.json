@@ -47,7 +47,7 @@
         },
         "path": {
           "type": "string",
-          "description": "Perspective view path as returned by the API (e.g. /home)",
+          "description": "Perspective view path derived from filesystem (e.g. /home)",
           "pattern": "^/"
         },
         "url": {
@@ -57,12 +57,12 @@
         },
         "discovered_by": {
           "type": "string",
-          "enum": ["api", "browser", "both"],
+          "enum": ["filesystem", "both", "gateway_only"],
           "description": "Which discovery pass found this view"
         },
         "reachable": {
-          "type": "boolean",
-          "description": "Whether the browser pass could navigate to this view"
+          "type": ["boolean", "null"],
+          "description": "Whether the gateway probe confirmed this view is reachable. null means gateway validation was not performed."
         },
         "requires_auth": {
           "type": "boolean",
@@ -70,7 +70,7 @@
         },
         "nav_path": {
           "type": "array",
-          "description": "Ordered list of nav labels that lead to this view (from browser pass)",
+          "description": "Ordered list of nav labels that lead to this view (populated by agent-browser in a future phase)",
           "items": {
             "type": "string"
           }

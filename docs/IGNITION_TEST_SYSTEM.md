@@ -69,28 +69,50 @@ project-repo/
 
 ## Discovery System (Two-Pass)
 
-### Pass 1 — API (Structure)
+Ignition Perspective view files are committed to git alongside the rest of the project. This makes the filesystem the most reliable and complete source of truth — it works before any gateway is running, it requires no auth, and it aligns directly with git diffs (making PR-scoped test selection trivial: changed file paths already are view paths).
 
-Queries the Ignition Gateway REST API to get the complete view tree for the project.
+### Pass 1 — Filesystem (Primary Source)
 
-**Endpoint:**
+Walks `views_directory` (from `gateway-config.json`) and collects all view paths. Each Perspective view is a folder containing a `view.json` file.
+
 ```
-GET http://{gateway}:8088/data/perspective/views?projectName={project}
+{views_directory}/folder/subpage/view.json  ->  /folder/subpage
 ```
 
-This is the authoritative source — it returns every view that exists regardless of whether it is linked in navigation. The response is a nested tree that is flattened into a list of view paths.
+- No gateway, no network, no credentials required
+- `exclude_views` paths are filtered out after collection
+- Result is sorted and deduplicated
+- Every discovered path is logged with a total count
 
-### Pass 2 — Browser (Validation)
+### Pass 2 — Gateway (Validation)
 
-Launches the app via `agent-browser` (dogfood skill) and crawls the live app to:
-- Confirm which API-discovered views are actually reachable via navigation
-- Detect views that are linked in nav but absent from the API (e.g. dynamically injected)
-- Identify whether a view requires authentication to reach
-- Record the nav path that leads to each view
+Validates filesystem-discovered views against the live gateway. **Non-blocking**: if the gateway is unreachable at any point the run continues with filesystem-only results — it does not halt.
+
+**Step 1 — API fetch:**
+```
+GET {gateway_url}/data/perspective/views?projectName={project}
+```
+Returns the gateway's current view list for cross-referencing. Handles multiple response shapes (list, dict, nested tree). Auth: tries unauthenticated first; retries with Basic auth on 401.
+
+**Step 2 — HTTP probe:** HTTP-probes each filesystem URL to confirm reachability and detect auth requirements:
+- HTTP 401 or 403 → `requires_auth: true`
+- Final URL contains: `login`, `/auth`, `status=401`, `status=403` → `requires_auth: true`
+- HTML contains: `perspective-login`, `ignition-login`, `loginForm`, `Please log in`, etc. → `requires_auth: true`
+
+If a view signals auth on an unauthenticated probe, a second probe is made with credentials to confirm reachability.
+
+**Known limitation:** Perspective is a React SPA. Auth implemented purely client-side (no HTTP redirect) will not be detected by HTTP probing. Full JS-rendered auth detection requires `agent-browser` and is planned for a future phase.
+
+`nav_path` is always `[]` in the current phase — `agent-browser` will populate it in the browser-crawl phase.
 
 ### Reconciliation
 
-API results and browser results are merged into a single manifest. Each entry is tagged with how it was discovered (`api`, `browser`, `both`) and whether the browser pass could reach it. Discrepancies (views in API but not reachable, or vice versa) are flagged in the manifest as warnings.
+Filesystem is the source of truth. Each entry is tagged:
+- `discovered_by: "filesystem"` — found on disk, gateway not available; `reachable: null`
+- `discovered_by: "both"` — found on disk and confirmed by gateway probe; `reachable: true/false`
+- `discovered_by: "gateway_only"` — returned by gateway API but absent from filesystem; flagged with a warning (possible stale gateway state or uncommitted view)
+
+Discrepancies are recorded in a `warnings` array: filesystem views unreachable via probe, and gateway-only views not found on disk.
 
 ---
 
@@ -124,6 +146,26 @@ API results and browser results are merged into a single manifest. Each entry is
 ```
 
 The manifest is the stable input to test generation. CI always tests against the committed manifest, not a freshly generated one. This is what makes runs deterministic.
+
+### ID Format
+
+View IDs are derived deterministically from the path: `/Reports/Daily Detail` → `view__reports_daily_detail`. Non-alphanumeric characters (spaces, dashes, dots) are replaced with `_`; consecutive underscores are collapsed.
+
+### Auth Test Flag
+
+The `auth` test flag mirrors `requires_auth` exactly — views that require auth get the auth test scenario; public views do not. This is set automatically during manifest build and should not be hand-edited.
+
+### Validation
+
+The manifest is validated against `config/schema.json` (JSON Schema draft-07) on every write. `jsonschema` is used when installed; otherwise a manual field-level check runs as a fallback. The schema `$id` is stripped before validation to prevent `jsonschema` from attempting a network fetch.
+
+### Diff
+
+Before writing, the new manifest is diffed against any existing one. Only fields that affect test generation are compared: `reachable`, `requires_auth`, `discovered_by`, `tests`. Cosmetic changes (e.g. `generated_at`) do not produce diff output.
+
+### Atomic Write
+
+The manifest is written to a `.tmp` file then renamed into place. An existing manifest is never partially overwritten on failure.
 
 ---
 
@@ -166,24 +208,27 @@ The single file that is manually added to a project repo. Everything else is gen
 ### Behavior on First Run
 
 1. Check for Python 3.8+ and Node.js
-2. Fetch latest version from central repo, compare against local `VERSION` if present
-3. Pull latest templates, helpers, and generator scripts from central repo
-4. Prompt for or read from environment: gateway URL, project name, credentials
-5. Write `gateway-config.json` with mode (`persistent` or `ephemeral`) and config
+2. Fetch latest `VERSION` from central repo (URL read from `IGNITION_TEST_CENTRAL_REPO` env var); compare against local `VERSION` if present
+3. Pull latest templates, helpers, and generator scripts from central repo into `_ignition_test/`
+4. Prompt for or read from environment: gateway URL, project name, gateway mode. For ephemeral mode, auto-detects `docker-compose.test.yml` files and parses them for gateway addresses and project names.
+5. Write `gateway-config.json` with mode (`persistent` or `ephemeral`) and resolved config
 6. Install npm dependencies (`@playwright/test`, `agent-browser`)
 7. Run `npx playwright install chromium`
-8. Install dogfood skill: `npx skills add vercel-labs/agent-browser --skill dogfood`
-9. If ephemeral mode: validate `docker-compose.test.yml` exists and `.gwbk` is mounted
-10. Spin up gateway (if ephemeral), wait for readiness
-11. Run two-pass discovery, write `manifest.json`
-12. Generate Playwright test files from templates into `tests/generated/`
-13. Write `playwright.config.ts`, `.env.test.example`, `test-start`, `.github/workflows/ignition-tests.yml`
+8. Install dogfood skill via PTY: `npx skills add vercel-labs/agent-browser --skill dogfood` (PTY required because the skill installer is a TUI)
+9. If ephemeral mode: validate `docker-compose.test.yml` exists and `.gwbk` is mounted into the compose service
+10. Write `playwright.config.ts`, `.env.test.example`, `test-start`, `.github/workflows/ignition-tests.yml`
+11. Run two-pass discovery (via `generator/discover.py`), write `tests/manifest.json` (via `generator/manifest.py`)
+12. Generate Playwright test files from templates into `tests/generated/` (Phase 4)
 
 ### Behavior on Subsequent Runs (Update Check)
 
 1. Fetch `VERSION` from central repo
-2. If newer: pull updated templates and helpers, re-generate any tests affected by template changes
-3. Re-run discovery if `--refresh` flag is passed, produce a manifest diff, open a PR with changes
+2. If newer: pull updated files listed in `UPDATABLE_FILES` (templates, helpers, generator scripts, schema) into `_ignition_test/`; re-generate any tests affected by template changes
+3. Re-run discovery if `--refresh` flag is passed: `python3 bootstrap.py --refresh` calls `run_discovery()` which imports `discover` and `manifest` from `_ignition_test/generator/` (falls back to `generator/` in the central repo), runs both passes, and writes the updated manifest
+
+### Generator Module Loading
+
+`bootstrap.py` imports `generator/discover.py` and `generator/manifest.py` dynamically at runtime using `importlib`. It searches `_ignition_test/generator/` first (updated copies in project repos) then `generator/` (central repo during development). Modules are evicted from `sys.modules` before each import so updated files are always picked up without restarting the process.
 
 ---
 
@@ -304,11 +349,16 @@ Build the central repo structure. Establish VERSION, schema, and the update-chec
 ### Phase 2 — Bootstrap Script
 Implement `bootstrap.py`. Covers dependency installation, config interrogation, file generation, and the initial end-to-end flow. Goal: `./test-start` works locally by end of this phase.
 
-### Phase 3 — Discovery & Manifest
-Implement two-pass discovery. API pass against Ignition views endpoint. Browser pass via `agent-browser`. Reconciliation logic. Manifest write and diff.
+### Phase 3 — Discovery & Manifest ✓
+Filesystem-first two-pass discovery. Pass 1: walk `views_directory` for `view.json` files — no gateway required. Pass 2: validate against live gateway API (multi-shape response handling, basic auth retry, SSL) + HTTP probe (URL/HTML auth signals); non-blocking if gateway unreachable. Reconciliation with `filesystem`/`both`/`gateway_only` tagging and warnings. `reachable: null` for unvalidated views. Manifest build, JSON Schema validation (jsonschema + manual fallback), significant-field diff, atomic write.
 
 ### Phase 4 — Test Templates
-Implement all five template types. Wire generator to stamp out test files from manifest entries. Validate generated tests run correctly against a live gateway.
+Implement all five template types (`smoke`, `navigation`, `components`, `auth`, `screenshot`). Wire `generator/generate.py` to read `tests/manifest.json` and stamp out one spec file per view per enabled test type into `tests/generated/{view_id}.{test_type}.spec.ts`. Validate generated tests run correctly against a live gateway.
+
+**Inputs from Phase 3:**
+- `tests/manifest.json` — committed, conforming to `config/schema.json`
+- Per view: `id`, `path`, `url`, `requires_auth`, `tests` flags
+- Templates in `templates/*.ts.tmpl`
 
 ### Phase 5 — Docker Orchestration
 Implement `gateway.py`. Persistent health check. Ephemeral spin-up, readiness polling, teardown. `.gwbk` validation.

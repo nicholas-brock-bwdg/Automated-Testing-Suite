@@ -71,12 +71,16 @@ def build_manifest(config: dict, views: list) -> dict:
         path          = v["path"]
         requires_auth = v.get("requires_auth", False)
 
+        # reachable=None means gateway validation was not performed (filesystem-only run).
+        # Pass it through as null so the manifest accurately reflects unvalidated state.
+        reachable = v.get("reachable")  # may be True, False, or None
+
         entry: dict = {
             "id":            path_to_id(path),
             "path":          path,
             "url":           f"{gateway_url}/data/perspective/client/{project_name}{path}",
-            "discovered_by": v.get("discovered_by", "api"),
-            "reachable":     v.get("reachable", True),
+            "discovered_by": v.get("discovered_by", "filesystem"),
+            "reachable":     reachable,
             "requires_auth": requires_auth,
             "tests": {
                 "smoke":      True,
@@ -167,7 +171,7 @@ def _manual_validate(manifest: dict) -> list:
         errors.append("'views' must be an array")
         return errors
 
-    valid_discovered = {"api", "browser", "both"}
+    valid_discovered = {"filesystem", "both", "gateway_only"}
     required_view    = ["id", "path", "url", "discovered_by", "reachable", "requires_auth", "tests"]
     required_tests   = ["smoke", "navigation", "components", "auth", "screenshot"]
 
@@ -188,6 +192,10 @@ def _manual_validate(manifest: dict) -> list:
                 f"{pfx}.discovered_by: must be one of {sorted(valid_discovered)}, "
                 f"got {v.get('discovered_by')!r}"
             )
+
+        reachable = v.get("reachable")
+        if reachable is not None and not isinstance(reachable, bool):
+            errors.append(f"{pfx}.reachable: must be boolean or null")
 
         tests = v.get("tests", {})
         for key in required_tests:
