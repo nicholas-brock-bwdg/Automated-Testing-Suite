@@ -977,6 +977,72 @@ def run_discovery(config: dict) -> None:
 
 
 # ===========================================================================
+# PHASE 4 — Test Generation
+# ===========================================================================
+
+def _copy_login_helper() -> None:
+    """Copy helpers/login.ts into tests/helpers/ so spec files can import it."""
+    helper_dirs = [
+        LOCAL_TOOLING_DIR / "helpers",
+        Path("helpers"),
+    ]
+    src = next((d / "login.ts" for d in helper_dirs if (d / "login.ts").exists()), None)
+
+    if src is None:
+        print(
+            "  WARNING: helpers/login.ts not found — auth tests may fail.",
+            file=sys.stderr,
+        )
+        return
+
+    dest = TESTS_DIR / "helpers" / "login.ts"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dest)
+    print(f"  Copied {src} -> {dest}")
+
+
+def run_generation(config: dict) -> None:
+    """
+    Phase 4: Render Playwright spec files from manifest + templates.
+
+    Imports generator/generate.py dynamically (same search order as discover/manifest).
+    Reads:  tests/manifest.json, templates/*.ts.tmpl
+    Writes: tests/generated/{view_id}.{test_type}.spec.ts
+            tests/helpers/login.ts
+    """
+    print("\n=== Phase 4 — Test Generation ===")
+
+    manifest_path = TESTS_DIR / "manifest.json"
+    if not manifest_path.exists():
+        print(
+            "  No manifest found — run discovery first (python3 bootstrap.py --refresh).",
+            file=sys.stderr,
+        )
+        return
+
+    try:
+        generate = _load_generator_module("generate")
+    except RuntimeError as exc:
+        print(f"\nERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    # Find templates directory: _ignition_test/templates/ first, then local templates/
+    tmpl_dirs = [LOCAL_TOOLING_DIR / "templates", Path("templates")]
+    templates_dir = next((d for d in tmpl_dirs if d.exists()), None)
+    if templates_dir is None:
+        print("  ERROR: templates/ directory not found.", file=sys.stderr)
+        return
+
+    output_dir = TESTS_DIR / "generated"
+    generate.generate(manifest_path, templates_dir, output_dir, config)
+
+    # Copy the login helper into tests/helpers/ so auth specs can import it
+    _copy_login_helper()
+
+    print("\nTest files written to tests/generated/.")
+
+
+# ===========================================================================
 # PHASE 5 STUBS — Gateway Lifecycle
 # ===========================================================================
 
@@ -1077,17 +1143,25 @@ def bootstrap(args: argparse.Namespace) -> None:
     spin_up_gateway(config)
 
     # ------------------------------------------------------------------
-    # 7. Discovery (Phase 3 stub)
+    # 7. Discovery (Phase 3)
     # ------------------------------------------------------------------
-    manifest = TESTS_DIR / "manifest.json"
-    if not manifest.exists() or args.refresh:
+    manifest_file = TESTS_DIR / "manifest.json"
+    if not manifest_file.exists() or args.refresh:
         run_discovery(config)
     else:
-        print(f"\nFound existing {manifest} — skipping discovery.")
+        print(f"\nFound existing {manifest_file} — skipping discovery.")
         print("  Pass --refresh to re-run discovery and update the manifest.")
 
     # ------------------------------------------------------------------
-    # 8. Gateway teardown (Phase 5 stub)
+    # 8. Test generation (Phase 4)
+    # ------------------------------------------------------------------
+    if not args.skip_generate:
+        run_generation(config)
+    else:
+        print("\nSkipping test generation (--skip-generate).")
+
+    # ------------------------------------------------------------------
+    # 9. Gateway teardown (Phase 5 stub)
     # ------------------------------------------------------------------
     tear_down_gateway(config)
 
@@ -1097,8 +1171,9 @@ def bootstrap(args: argparse.Namespace) -> None:
     print("\n=== Bootstrap complete ===")
     print("Next steps:")
     print("  1. Copy .env.test.example -> .env.test and fill in real credentials.")
-    print("  2. Run ./test-start once Phase 5 (gateway lifecycle) is implemented.")
-    print("  3. Or run: python3 bootstrap.py --refresh to re-run discovery now.")
+    print("  2. Run ./test-start to execute tests.")
+    print("  3. Run: python3 bootstrap.py --refresh to re-run discovery.")
+    print("  4. Run: python3 bootstrap.py --refresh --skip-generate to update manifest only.")
 
 
 # ===========================================================================
@@ -1112,8 +1187,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         epilog="""
 Phases implemented:
   Phase 1  Update-check mechanism
-  Phase 2  Config, dependency install, file generation (current)
-  Phase 3+ Discovery, manifest, test generation (stubs — see source)
+  Phase 2  Config, dependency install, file generation
+  Phase 3  Two-pass discovery, manifest build/validate/write
+  Phase 4  Test file generation from templates
         """,
     )
     parser.add_argument(
@@ -1139,6 +1215,12 @@ Phases implemented:
         action="store_true",
         default=False,
         help="Re-run config prompts even if gateway-config.json already exists.",
+    )
+    parser.add_argument(
+        "--skip-generate",
+        action="store_true",
+        default=False,
+        help="(Phase 4) Skip test file generation after discovery.",
     )
     return parser
 
