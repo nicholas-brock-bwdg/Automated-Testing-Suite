@@ -153,7 +153,7 @@ def api_pass(gateway_url, project_name, exclude_views, *, debug=True):
         if with_auth and creds:
             opener = _auth_opener(*creds, gateway_url)
         else:
-            opener = urllib.request.build_opener()
+            opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=_ssl_ctx))
         req = urllib.request.Request(endpoint)
         try:
             with opener.open(req, timeout=30) as resp:
@@ -250,9 +250,12 @@ def _probe(url, username=None, password=None):
     if username and password:
         mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
         mgr.add_password(None, url, username, password)
-        opener = urllib.request.build_opener(urllib.request.HTTPBasicAuthHandler(mgr))
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPBasicAuthHandler(mgr),
+            urllib.request.HTTPSHandler(context=_ssl_ctx),
+        )
     else:
-        opener = urllib.request.build_opener()
+        opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=_ssl_ctx))
 
     html_preview = ""
     try:
