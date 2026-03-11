@@ -14,11 +14,17 @@ from __future__ import annotations
 import json
 import os
 import re
+import ssl
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Optional
+
+# Accept self-signed / internal CA certificates common in local Ignition installs.
+_ssl_ctx = ssl.create_default_context()
+_ssl_ctx.check_hostname = False
+_ssl_ctx.verify_mode = ssl.CERT_NONE
 
 
 # ---------------------------------------------------------------------------
