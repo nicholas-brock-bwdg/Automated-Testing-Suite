@@ -6,49 +6,56 @@ Full spec: @docs/IGNITION_TEST_SYSTEM.md
 
 ## Phase status
 - Phase 1 DONE: directory structure, VERSION (0.1.0), config/schema.json, bootstrap.py update-check
-- Phase 2 DONE: full bootstrap flow (config, npm install, dogfood, file generation, Phase 3/5 stubs)
-- Phase 3 NEXT: two-pass discovery (API + browser), manifest.json generation
-- Phases 4–6: not started
+- Phase 2 DONE: full bootstrap flow (config, npm install, dogfood, file generation)
+- Phase 3 DONE: two-pass discovery + manifest write (not yet tested against live gateway — pending project repo setup)
+- Phase 4 NEXT: test template generation (5 templates → tests/generated/)
+- Phases 5–6: not started
 
 ## Key files
-- [bootstrap.py](bootstrap.py) — all Phase 1+2 logic; Phase 3/5 stubs with signature contracts
+- [bootstrap.py](bootstrap.py) — all orchestration; Phase 3 live via run_discovery()
 - [VERSION](VERSION) — `0.1.0`
 - [config/schema.json](config/schema.json) — JSON Schema (draft-07) for manifest.json
-- [generator/](generator/) — stubs for Phase 3/4
+- [generator/discover.py](generator/discover.py) — Phase 3 discovery implementation
+- [generator/manifest.py](generator/manifest.py) — Phase 3 manifest build/validate/diff/write
+- [generator/generate.py](generator/generate.py) — Phase 4 stub
 - [templates/](templates/) — five .ts.tmpl stubs for Phase 4
 - [helpers/](helpers/) — stubs for Phase 4/5
 - [actions/](actions/) — stub for Phase 6
 
-## bootstrap.py — Phase 2 design
-- `interrogate_config()` — env-var-first, falls back to interactive prompts
-  - Env vars: IGNITION_GATEWAY_URL, IGNITION_PROJECT_NAME, IGNITION_VIEWS_DIR,
-    IGNITION_GATEWAY_MODE, IGNITION_COMPOSE_FILE
-- `load_existing_config()` — reads gateway-config.json; skips prompts if found
-- `--reconfigure` flag forces re-prompting even if gateway-config.json exists
-- `write_gateway_config(config)` — writes gateway-config.json (spec schema)
-- `write_env_example()` — writes .env.test.example with all env var placeholders
-- `install_node_deps()` — writes package.json if absent, npm install, playwright install chromium
-- `install_dogfood_skill()` — npx skills add vercel-labs/agent-browser --skill dogfood
-- `validate_ephemeral(config)` — checks compose file exists; warns (does not halt) if no .gwbk found
-- `generate_playwright_config(config)` — writes playwright.config.ts
-- `generate_test_start(config)` — writes test-start (chmod 755); handles --view, --refresh, --update-snapshots
-- `_generate_github_action_stub()` — writes .github/workflows/ignition-tests.yml Phase 6 stub
-- `spin_up_gateway(config)` — Phase 5 stub with full signature contract in docstring
-- `tear_down_gateway(config)` — Phase 5 stub
-- `run_discovery(config)` — Phase 3 stub with full signature contract in docstring
-- `bootstrap(args)` — orchestrates all 8 steps; skips discovery if manifest.json exists
-- `main()` — always runs check_for_updates() first, then bootstrap()
+## generator/discover.py — design
+- `api_pass(gateway_url, project_name, exclude_views, *, debug)` → list[str]
+  - GET /data/perspective/views?projectName={project}
+  - Tries unauthenticated first; retries with basic auth on HTTP 401
+  - Logs raw response shape (type, keys, first 1000 chars) for debugging
+  - Handles: list[str], list[dict], {views:[...]}, tree {name,children}, unknown
+  - Excludes paths in config["exclude_views"]
+- `browser_pass(gateway_url, project_name, api_paths)` → list[dict]
+  - HTTP probe each view URL (unauthenticated, then authenticated if blocked)
+  - Detects auth via HTTP 401/403, redirect URL signals, HTML content scan
+  - Limitation: JS-rendered auth (Perspective SPA) not detectable — noted, future agent-browser phase
+  - nav_path always [] for now — agent-browser will populate in future
+- `reconcile(api_paths, browser_results)` → list[dict]
+  - Tags: api / both / browser
+  - Flags API-only unreachable and browser-only views with warnings
+- `run(config, *, debug)` → list[dict] — main entry point
 
-## Phase 3 stub contract (from bootstrap.py docstring)
-- Signature: `run_discovery(config: dict) -> None`
-- Reads: config["gateway_url"], config["project_name"], config["views_directory"], config["exclude_views"]
-- Writes: tests/manifest.json conforming to config/schema.json
-- Raises: RuntimeError on unrecoverable failure
+## generator/manifest.py — design
+- `path_to_id(path)` → `view__home_detail` format (lowercase, slashes→underscore)
+- `build_manifest(config, views)` → manifest dict (auth test flag mirrors requires_auth)
+- `validate_manifest(manifest, schema_path)` → list[str] errors
+  - Uses jsonschema if installed; falls back to manual checks
+  - Strips $id from schema to prevent network fetch attempts
+- `diff_manifest(old, new)` → {added, removed, changed, unchanged}
+  - Compares significant fields: reachable, requires_auth, discovered_by, tests
+- `print_diff(diff)` — human-readable diff output
+- `write_manifest_atomic(manifest, dest)` — writes .tmp then rename
+- `build_and_write(config, views, dest)` — validate → diff → write
 
-## Phase 5 stub contract (from bootstrap.py docstring)
-- `spin_up_gateway(config)` — persistent: ping /data/ignition/ping; ephemeral: compose up + poll
-- `tear_down_gateway(config)` — ephemeral only: compose down
-- Both read: config["mode"], config["gateway_url"], config.get("compose_file"), config["readiness_timeout_seconds"]
+## bootstrap.py — Phase 3 wiring
+- `_load_generator_module(name)` — finds generator/ in _ignition_test/ or local generator/
+  - Deletes from sys.modules before re-importing (supports hot updates)
+- `run_discovery(config)` — imports discover + manifest, calls discover.run() then manifest.build_and_write()
+- `generate_test_start()` — --refresh now calls `python3 bootstrap.py --refresh` (was TODO)
 
 ## Env var reference
 | Var | Purpose |
@@ -59,5 +66,12 @@ Full spec: @docs/IGNITION_TEST_SYSTEM.md
 | IGNITION_GATEWAY_MODE | persistent or ephemeral |
 | IGNITION_COMPOSE_FILE | Path to docker-compose.test.yml (ephemeral only) |
 | IGNITION_VIEWS_DIR | Views directory relative to project root |
-| IGNITION_TEST_USER | Test auth username |
-| IGNITION_TEST_PASSWORD | Test auth password |
+| IGNITION_TEST_USER | Test auth username (also used by discover.py) |
+| IGNITION_TEST_PASSWORD | Test auth password (also used by discover.py) |
+
+## Phase 4 contract (what generate.py needs from Phase 3)
+- Input: `tests/manifest.json` — committed, conforming to config/schema.json
+- For each view entry: id, path, url, requires_auth, tests flags
+- Templates in `templates/*.ts.tmpl` — one output file per view per enabled test type
+- Output: `tests/generated/{view_id}.{test_type}.spec.ts`
+- Generator reads manifest, not config — manifest is the stable contract

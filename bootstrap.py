@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import sys
 import os
+import select
 import subprocess
 import shutil
+import time
 import urllib.request
 import urllib.error
 import json
@@ -229,36 +231,211 @@ def _prompt(
     return entered if entered else (default or "")
 
 
+# ---------------------------------------------------------------------------
+# Compose-file introspection
+# ---------------------------------------------------------------------------
+
+def _find_compose_files() -> list[Path]:
+    """Return all docker-compose / compose YAML files in the current directory."""
+    found: list[Path] = []
+    for pattern in ("docker-compose*.yml", "docker-compose*.yaml",
+                    "compose*.yml", "compose*.yaml"):
+        found.extend(sorted(Path(".").glob(pattern)))
+    return found
+
+
+def _parse_compose_services(compose_path: Path) -> dict[str, str]:
+    """
+    Return {service_name: raw_block_text} for every service under `services:`.
+    Does not resolve YAML anchors — callers apply regex to the raw text.
+    """
+    text = compose_path.read_text(encoding="utf-8")
+    m = re.search(r'^services:\s*\n', text, re.MULTILINE)
+    if not m:
+        return {}
+
+    services_text = text[m.end():]
+    name_re = re.compile(r'^  ([A-Za-z0-9_-]+):\s*$', re.MULTILINE)
+    matches = list(name_re.finditer(services_text))
+
+    result: dict[str, str] = {}
+    for i, sm in enumerate(matches):
+        start = sm.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(services_text)
+        result[sm.group(1)] = services_text[start:end]
+    return result
+
+
+def _resolve_compose_vars(value: str) -> str:
+    """Replace ${VAR:-default} substitutions with their defaults."""
+    value = re.sub(r'\$\{[^:}]+:-([^}]+)\}', r'\1', value)
+    value = re.sub(r'\$\{[^}]+\}', '', value)
+    return value.strip()
+
+
+def _parse_ignition_gateways(compose_path: Path) -> list[dict]:
+    """
+    Return one dict per Ignition gateway service found in a compose file.
+    Detection: service block contains GATEWAY_PUBLIC_ADDRESS (only set on
+    bwdesigngroup/ignition-docker and similar images).
+
+    Each dict has:
+      name          str   — compose service name
+      url           str   — http:// URL derived from GATEWAY_PUBLIC_ADDRESS
+      projects      list  — [(local_path, project_name), ...] all /workdir/projects mounts
+    """
+    services = _parse_compose_services(compose_path)
+    gateways: list[dict] = []
+
+    vol_re = re.compile(r'(\./[^\s:]+):/workdir/projects/([A-Za-z0-9_-]+)')
+
+    for svc_name, block in services.items():
+        gpa_m = re.search(r'GATEWAY_PUBLIC_ADDRESS:\s*(\S+)', block)
+        if not gpa_m:
+            continue
+
+        address = _resolve_compose_vars(gpa_m.group(1))
+        url = f"http://{address}"
+
+        # Collect every project mount — no filtering; user picks.
+        seen: set[str] = set()
+        projects: list[tuple[str, str]] = []
+        for vm in vol_re.finditer(block):
+            local, proj_name = vm.group(1), vm.group(2)
+            if proj_name not in seen:
+                seen.add(proj_name)
+                projects.append((local, proj_name))
+
+        gateways.append({"name": svc_name, "url": url, "projects": projects})
+
+    return gateways
+
+
+def _detect_views_dir(local_project_path: str) -> str:
+    """
+    Resolve the Perspective views directory for a project mounted at
+    local_project_path. Falls back to 'ignition/views' if not found.
+    """
+    candidate = (
+        Path(local_project_path)
+        / "com.inductiveautomation.perspective"
+        / "views"
+    )
+    if candidate.exists():
+        return str(candidate).lstrip("./").lstrip("/")
+    return "ignition/views"
+
+
+# ---------------------------------------------------------------------------
+# Interactive gateway + project selection
+# ---------------------------------------------------------------------------
+
+def _select_from_list(prompt: str, options: list[str], default: int = 1) -> int:
+    """Prompt the user to pick from a numbered list. Returns 0-based index."""
+    while True:
+        raw = input(f"  {prompt} [{default}]: ").strip() or str(default)
+        try:
+            idx = int(raw) - 1
+            if 0 <= idx < len(options):
+                return idx
+        except ValueError:
+            pass
+        print(f"  Enter a number between 1 and {len(options)}.")
+
+
+def _pick_gateway_and_project() -> tuple[str, str, str]:
+    """
+    Scan compose files, present gateways, let user select one,
+    then select the Ignition project on that gateway.
+    Returns (gateway_url, project_name, views_dir).
+    """
+    # Env-var short-circuit
+    env_url = os.environ.get("IGNITION_GATEWAY_URL", "").strip()
+    env_proj = os.environ.get("IGNITION_PROJECT_NAME", "").strip()
+    if env_url and env_proj:
+        views_dir = os.environ.get("IGNITION_VIEWS_DIR", "ignition/views")
+        print(f"  Using environment: {env_url}  /  project: {env_proj}")
+        return env_url.rstrip("/"), env_proj, views_dir
+
+    # Discover gateways from all compose files
+    all_gateways: list[dict] = []
+    for cf in _find_compose_files():
+        all_gateways.extend(_parse_ignition_gateways(cf))
+
+    if not all_gateways:
+        print("  No Ignition gateways found in compose files.")
+        url = _prompt("Gateway URL", "IGNITION_GATEWAY_URL", "http://localhost:8088").rstrip("/")
+        proj = _prompt("Ignition project name", "IGNITION_PROJECT_NAME")
+        views = _prompt("Views directory", "IGNITION_VIEWS_DIR", "ignition/views")
+        return url, proj, views
+
+    # --- Pick gateway ---
+    gw_labels = [f"{gw['name']}  →  {gw['url']}" for gw in all_gateways]
+    gw_labels.append("Enter URL manually")
+    print("\n  Ignition gateways found:")
+    for i, label in enumerate(gw_labels, 1):
+        print(f"    [{i}] {label}")
+
+    gw_idx = _select_from_list("Select gateway", gw_labels)
+    if gw_idx == len(all_gateways):
+        url = _prompt("Gateway URL", default="http://localhost:8088").rstrip("/")
+        proj = _prompt("Ignition project name")
+        views = _prompt("Views directory", default="ignition/views")
+        return url, proj, views
+
+    chosen_gw = all_gateways[gw_idx]
+    gateway_url = chosen_gw["url"]
+    projects: list[tuple[str, str]] = chosen_gw["projects"]
+
+    # --- Pick project ---
+    if not projects:
+        proj = _prompt("Ignition project name", "IGNITION_PROJECT_NAME")
+        views = _prompt("Views directory", "IGNITION_VIEWS_DIR", "ignition/views")
+        return gateway_url, proj, views
+
+    if len(projects) == 1:
+        local_path, proj_name = projects[0]
+        print(f"\n  Detected project: {proj_name}  ({local_path})")
+        override = input("  Press Enter to confirm, or type a different name: ").strip()
+        proj_name = override if override else proj_name
+        views_dir = _detect_views_dir(local_path)
+    else:
+        proj_labels = [f"{pn}  ({lp})" for lp, pn in projects]
+        print(f"\n  Projects on {chosen_gw['name']}:")
+        for i, label in enumerate(proj_labels, 1):
+            print(f"    [{i}] {label}")
+        proj_idx = _select_from_list("Select project", proj_labels)
+        local_path, proj_name = projects[proj_idx]
+        views_dir = _detect_views_dir(local_path)
+
+    print(f"  Views directory detected: {views_dir}")
+    views_override = input("  Press Enter to confirm, or type a different path: ").strip()
+    views_dir = views_override if views_override else views_dir
+
+    return gateway_url, proj_name, views_dir
+
+
+# ---------------------------------------------------------------------------
+# Config load / write
+# ---------------------------------------------------------------------------
+
 def load_existing_config() -> dict | None:
     """Load gateway-config.json if it exists, else return None."""
     if GATEWAY_CONFIG_FILE.exists():
-        with GATEWAY_CONFIG_FILE.open() as fh:
+        with GATEWAY_CONFIG_FILE.open(encoding="utf-8") as fh:
             return json.load(fh)
     return None
 
 
 def interrogate_config() -> dict:
-    """Collect gateway config via env vars + interactive prompts."""
-    print("\nConfiguring gateway connection (env vars take precedence over prompts):")
+    """Collect gateway config via compose introspection + interactive prompts."""
+    print("\nConfiguring gateway connection:")
+    gateway_url, project_name, views_dir = _pick_gateway_and_project()
 
-    gateway_url  = _prompt("Gateway URL",          "IGNITION_GATEWAY_URL",  "http://localhost:8088")
-    project_name = _prompt("Ignition project name","IGNITION_PROJECT_NAME")
-    views_dir    = _prompt("Views directory",       "IGNITION_VIEWS_DIR",    "ignition/views")
-
-    mode_raw = _prompt(
-        "Gateway mode",
-        "IGNITION_GATEWAY_MODE",
-        "persistent",
-    )
-    mode = mode_raw.lower().strip()
-    if mode not in ("persistent", "ephemeral"):
-        print(f"  WARNING: Unknown mode '{mode}', defaulting to 'persistent'.")
-        mode = "persistent"
-
-    config: dict = {
-        "mode": mode,
+    return {
+        "mode": "persistent",
         "project_name": project_name,
-        "gateway_url": gateway_url.rstrip("/"),
+        "gateway_url": gateway_url,
         "readiness_timeout_seconds": 120,
         "views_directory": views_dir,
         "auth": {
@@ -272,16 +449,6 @@ def interrogate_config() -> dict:
         "exclude_views": [],
     }
 
-    if mode == "ephemeral":
-        compose_file = _prompt(
-            "Path to docker-compose.test.yml",
-            "IGNITION_COMPOSE_FILE",
-            "docker-compose.test.yml",
-        )
-        config["compose_file"] = compose_file
-
-    return config
-
 
 def write_gateway_config(config: dict) -> None:
     GATEWAY_CONFIG_FILE.write_text(json.dumps(config, indent=2) + "\n")
@@ -291,6 +458,52 @@ def write_gateway_config(config: dict) -> None:
 # ---------------------------------------------------------------------------
 # .env.test.example
 # ---------------------------------------------------------------------------
+
+def update_gitignore() -> None:
+    """Append bootstrap-generated paths to .gitignore (skips entries already present)."""
+    entries = [
+        ("# Ignition test automation — local tooling (pulled from central repo)", None),
+        ("_ignition_test/", "_ignition_test/"),
+        ("", None),
+        ("# Generated project files (local use only)", None),
+        ("gateway-config.json", "gateway-config.json"),
+        ("playwright.config.ts", "playwright.config.ts"),
+        ("test-start", "test-start"),
+        (".env.test.example", ".env.test.example"),
+        ("tests/", "tests/"),
+        (".github/", ".github/"),
+        ("", None),
+        ("# Node / Playwright", None),
+        ("node_modules/", "node_modules/"),
+        ("package.json", "package.json"),
+        ("package-lock.json", "package-lock.json"),
+        ("playwright-report/", "playwright-report/"),
+        ("test-results/", "test-results/"),
+        ("", None),
+        ("# Dogfood skill (installed by bootstrap)", None),
+        (".agents/", ".agents/"),
+        ("skills-lock.json", "skills-lock.json"),
+        ("", None),
+        ("# Test credentials — never commit real values", None),
+        (".env.test", ".env.test"),
+    ]
+
+    gitignore = Path(".gitignore")
+    existing = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
+
+    new_lines: list[str] = []
+    for line, check in entries:
+        if check is None or check not in existing:
+            new_lines.append(line)
+
+    if not new_lines:
+        print("  .gitignore already up to date.")
+        return
+
+    separator = "\n" if existing and not existing.endswith("\n") else ""
+    gitignore.write_text(existing + separator + "\n".join(new_lines) + "\n", encoding="utf-8")
+    print(f"  Updated .gitignore ({len([l for l in new_lines if l and not l.startswith('#')])} entries added)")
+
 
 def write_env_example() -> None:
     """Write .env.test.example with placeholder values for all env vars."""
@@ -381,11 +594,65 @@ def install_node_deps() -> None:
 
 
 def install_dogfood_skill() -> None:
-    """Install the agent-browser dogfood skill via npx."""
-    _run(
+    """
+    Install the agent-browser dogfood skill.
+
+    The `npx skills add` installer is a TUI that requires a pseudo-TTY.
+    We create one via the stdlib `pty` module and send Enter keypresses to
+    accept the default selection (Universal .agents/skills — always included).
+    Falls back to a manual instruction on non-Unix platforms.
+    """
+    print("\nInstalling dogfood skill (agent-browser)...")
+    try:
+        import pty
+    except ImportError:
+        print(
+            "  [Skipped] pty module not available on this platform.\n"
+            "  Run manually:\n"
+            "    npx skills add vercel-labs/agent-browser --skill dogfood"
+        )
+        return
+
+    master_fd, slave_fd = pty.openpty()
+    proc = subprocess.Popen(
         ["npx", "skills", "add", "vercel-labs/agent-browser", "--skill", "dogfood"],
-        "Installing dogfood skill (agent-browser)",
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
     )
+    os.close(slave_fd)
+
+    last_enter = 0.0
+    try:
+        while proc.poll() is None:
+            r, _, _ = select.select([master_fd], [], [], 0.2)
+            if r:
+                try:
+                    os.read(master_fd, 4096)   # drain output so the PTY doesn't block
+                except OSError:
+                    break
+            now = time.monotonic()
+            if now - last_enter >= 0.5:
+                try:
+                    os.write(master_fd, b"\r\n")
+                    last_enter = now
+                except OSError:
+                    break
+    finally:
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+
+    proc.wait()
+    if proc.returncode not in (0, None):
+        print(
+            f"  WARNING: dogfood skill installer exited {proc.returncode}.\n"
+            "  Run manually if needed:\n"
+            "    npx skills add vercel-labs/agent-browser --skill dogfood"
+        )
+    else:
+        print("  Dogfood skill installed.")
 
 
 # ---------------------------------------------------------------------------
@@ -541,12 +808,11 @@ def generate_test_start(config: dict) -> None:
         "python3 bootstrap.py --update-check",
         "",
         "# ---------------------------------------------------------------------------",
-        "# Manifest refresh (Phase 3)",
+        "# Manifest refresh",
         "# ---------------------------------------------------------------------------",
         'if [ "$REFRESH" = true ]; then',
-        '  echo "Refreshing manifest..."',
-        "  # TODO (Phase 3): python3 bootstrap.py --refresh",
-        '  echo "  --refresh not yet implemented. Complete Phase 3 first."',
+        '  echo "Refreshing manifest (re-running discovery)..."',
+        "  python3 bootstrap.py --refresh",
         "fi",
         "",
         "# ---------------------------------------------------------------------------",
@@ -644,40 +910,70 @@ def _generate_github_action_stub() -> None:
 
 
 # ===========================================================================
-# PHASE 3 STUB — Discovery & Manifest
+# PHASE 3 — Discovery & Manifest
 # ===========================================================================
+
+def _load_generator_module(name: str):
+    """
+    Dynamically import a generator module (discover or manifest).
+
+    Search order:
+      1. _ignition_test/generator/  — project repo (pulled from central repo)
+      2. generator/                 — central repo / development
+    """
+    import importlib
+
+    gen_dirs = [
+        LOCAL_TOOLING_DIR / "generator",   # project repo
+        Path("generator"),                  # central / dev
+    ]
+    gen_dir = next((d for d in gen_dirs if (d / f"{name}.py").exists()), None)
+
+    if gen_dir is None:
+        raise RuntimeError(
+            f"Cannot locate generator/{name}.py. "
+            "Run bootstrap.py to pull tooling before running discovery."
+        )
+
+    if str(gen_dir) not in sys.path:
+        sys.path.insert(0, str(gen_dir))
+
+    # Reload in case the module was already imported from a different location
+    if name in sys.modules:
+        del sys.modules[name]
+
+    return importlib.import_module(name)
+
 
 def run_discovery(config: dict) -> None:
     """
-    TODO (Phase 3): Two-pass view discovery and manifest generation.
+    Two-pass view discovery and manifest generation (Phase 3).
 
-    Pass 1 — API (Structure):
-        GET {gateway_url}/data/perspective/views?projectName={project_name}
-        Flatten the nested view tree into a list of view paths.
+    Imports generator/discover.py and generator/manifest.py dynamically
+    so they can be updated via the central repo pull without touching bootstrap.py.
 
-    Pass 2 — Browser (Validation):
-        Launch agent-browser (dogfood skill), crawl the live app.
-        Confirm reachable views, detect auth requirements, record nav paths.
-        Detect views linked in nav but absent from the API.
-
-    Reconciliation:
-        Merge API and browser results. Tag each view with discovered_by
-        ("api", "browser", "both"). Flag discrepancies as warnings.
-
-    Output:
-        Write tests/manifest.json conforming to config/schema.json.
-        The manifest is the stable contract — do not regenerate it on
-        every CI run; only update it via an explicit --refresh PR.
-
-    Signature contract (Phase 3 must honour):
-        run_discovery(config: dict) -> None
-        Reads:  config["gateway_url"], config["project_name"],
-                config["views_directory"], config["exclude_views"]
-        Writes: tests/manifest.json
-        Raises: RuntimeError on unrecoverable discovery failure
+    Reads:  config["gateway_url"], config["project_name"],
+            config["views_directory"], config["exclude_views"]
+    Writes: tests/manifest.json
+    Raises: RuntimeError on unrecoverable failure
     """
-    print("\n[Phase 3 TODO] Discovery not yet implemented — skipping manifest generation.")
-    print("  Complete Phase 3, then re-run bootstrap or ./test-start --refresh.")
+    print("\n=== Phase 3 — View Discovery ===")
+
+    try:
+        discover = _load_generator_module("discover")
+        manifest = _load_generator_module("manifest")
+    except RuntimeError as exc:
+        print(f"\nERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    # Two-pass discovery
+    views = discover.run(config)
+
+    # Build, validate, diff, and write manifest
+    TESTS_DIR.mkdir(parents=True, exist_ok=True)
+    manifest.build_and_write(config, views, TESTS_DIR / "manifest.json")
+
+    print("\nManifest written to tests/manifest.json.")
 
 
 # ===========================================================================
@@ -748,8 +1044,10 @@ def bootstrap(args: argparse.Namespace) -> None:
         write_gateway_config(config)
 
     # ------------------------------------------------------------------
-    # 2. .env.test.example
+    # 2. .gitignore + .env.test.example
     # ------------------------------------------------------------------
+    print("\nUpdating .gitignore...")
+    update_gitignore()
     print("\nWriting environment template...")
     write_env_example()
 
@@ -761,14 +1059,7 @@ def bootstrap(args: argparse.Namespace) -> None:
     install_dogfood_skill()
 
     # ------------------------------------------------------------------
-    # 4. Ephemeral-specific validation
-    # ------------------------------------------------------------------
-    if config.get("mode") == "ephemeral":
-        print("\nValidating ephemeral gateway configuration...")
-        validate_ephemeral(config)
-
-    # ------------------------------------------------------------------
-    # 5. Generate project files
+    # 4. Generate project files
     # ------------------------------------------------------------------
     print("\nGenerating project files...")
     generate_playwright_config(config)
@@ -805,9 +1096,9 @@ def bootstrap(args: argparse.Namespace) -> None:
     # ------------------------------------------------------------------
     print("\n=== Bootstrap complete ===")
     print("Next steps:")
-    print("  1. Copy .env.test.example → .env.test and fill in real credentials.")
-    print("  2. Complete Phase 3 (discovery) so manifest.json is generated.")
-    print("  3. Run ./test-start once Phases 3–5 are implemented.")
+    print("  1. Copy .env.test.example -> .env.test and fill in real credentials.")
+    print("  2. Run ./test-start once Phase 5 (gateway lifecycle) is implemented.")
+    print("  3. Or run: python3 bootstrap.py --refresh to re-run discovery now.")
 
 
 # ===========================================================================

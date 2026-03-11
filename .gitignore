@@ -1,0 +1,38 @@
+# Ignition test automation — local tooling (pulled from central repo)
+_ignition_test/
+
+# Node / Playwright
+node_modules/
+playwright-report/
+test-results/
+
+# Test credentials — never commit real values
+.env.test
+# Ignition test automation — local tooling (pulled from central repo)
+
+# Generated project files (local use only)
+gateway-config.json
+playwright.config.ts
+test-start
+.env.test.example
+tests/
+.github/
+
+# Node / Playwright
+package.json
+package-lock.json
+
+# Dogfood skill (installed by bootstrap)
+.agents/
+
+# Test credentials — never commit real values
+# Ignition test automation — local tooling (pulled from central repo)
+
+# Generated project files (local use only)
+
+# Node / Playwright
+
+# Dogfood skill (installed by bootstrap)
+skills-lock.json
+
+# Test credentials — never commit real values
